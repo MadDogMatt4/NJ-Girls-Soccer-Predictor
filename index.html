@@ -146,8 +146,11 @@
 const SPORT       = 'soccer_g';
 const SPORT_NAME  = 'Girls Soccer';
 
-// NJSIAA PowerPoint numbers for this sport (see NJSIAA chart).
-const CONFIG = {
+// NJSIAA PowerPoint numbers for this sport.
+// These are DEFAULTS — the app overwrites them from the `sports` table at load,
+// and admins can edit them in-app (Settings panel on the Teams tab). That means
+// next year's cutoff is a form field, not a code change.
+let CONFIG = {
   BEST_N:      12,             // best N per-game PowerPoint values are averaged
   FIRST_N:     12,             // residual + OOWP use opponents' FIRST N games
   MIN_GAMES:   12,             // if a team played fewer, divide by this anyway
@@ -297,15 +300,26 @@ async function adminLogout(){ await sb.auth.signOut(); location.reload(); }
 
 /* --------------------------- load everything ---------------------------- */
 async function loadAllData(){
-  const [teamRows, gameRows, predRows, flipRows, msgRes] = await Promise.all([
+  const [teamRows, gameRows, predRows, flipRows, msgRes, sportRes] = await Promise.all([
     fetchAllRows('teams', 'id,name,section,team_group,ineligible,is_out_of_state,njsiaa_member,manual_record,conference,division'),
     fetchAllRows('games', 'id,game_date,team_a,team_b,score_a,score_b'),
     currentUser
       ? sb.from('predictions').select('game_id,winning_team_id').eq('sport',SPORT).eq('user_id',currentUser.id)
       : Promise.resolve({ data: [] }),
     sb.from('coin_flips').select('key,winning_team_id').eq('sport',SPORT),
-    sb.from('site_message').select('message,maintenance_on,maintenance_message').eq('sport',SPORT).maybeSingle()
+    sb.from('site_message').select('message,maintenance_on,maintenance_message').eq('sport',SPORT).maybeSingle(),
+    sb.from('sports').select('best_n,first_n,min_games,ties_allowed,cutoff_date').eq('sport',SPORT).maybeSingle()
   ]);
+
+  // Sport settings come from the DB; anything null keeps its built-in default.
+  const s = sportRes && sportRes.data;
+  if (s){
+    if (s.best_n       != null) CONFIG.BEST_N       = s.best_n;
+    if (s.first_n      != null) CONFIG.FIRST_N      = s.first_n;
+    if (s.min_games    != null) CONFIG.MIN_GAMES    = s.min_games;
+    if (s.ties_allowed != null) CONFIG.TIES_ALLOWED = s.ties_allowed;
+    if (s.cutoff_date  != null) CONFIG.CUTOFF_DATE  = s.cutoff_date;
+  }
 
   state.teams = teamRows.map(dbTeamToLocal);
   state.games = gameRows.map(dbGameToLocal);
@@ -994,6 +1008,29 @@ function renderTeams(){
     </div>
 
     <div class="panel">
+      <h2>Sport Settings <span style="color:var(--gold); font-size:11px; text-transform:none;">(admin)</span></h2>
+      <p class="hint">These drive the whole PowerPoint calculation. Change them here each season — no code
+        change or redeploy needed. Saving recalculates every ranking immediately.</p>
+      <div class="form-row">
+        <div class="field"><label>Cutoff date</label>
+          <input type="date" id="cfgCutoff" value="${CONFIG.CUTOFF_DATE}"></div>
+        <div class="field"><label>Best N games</label>
+          <input type="number" id="cfgBestN" min="1" max="40" value="${CONFIG.BEST_N}" style="width:90px;"></div>
+        <div class="field"><label>First N games</label>
+          <input type="number" id="cfgFirstN" min="1" max="40" value="${CONFIG.FIRST_N}" style="width:90px;"></div>
+        <div class="field"><label>Minimum games</label>
+          <input type="number" id="cfgMinGames" min="1" max="40" value="${CONFIG.MIN_GAMES}" style="width:90px;"></div>
+        <div class="field"><label>Ties allowed</label>
+          <select id="cfgTies" style="width:100px;">
+            <option value="yes" ${CONFIG.TIES_ALLOWED?'selected':''}>Yes</option>
+            <option value="no" ${!CONFIG.TIES_ALLOWED?'selected':''}>No</option>
+          </select></div>
+        <button onclick="saveSportSettings()">Save settings</button>
+      </div>
+      <div id="cfgStatus" class="status-box"></div>
+    </div>
+
+    <div class="panel">
       <h2>Announcement &amp; Maintenance <span style="color:var(--gold); font-size:11px; text-transform:none;">(admin)</span></h2>
       <textarea id="msgInput" rows="2" style="width:100%;" placeholder="Public announcement banner">${escapeHtml(siteMessage)}</textarea>
       <div class="form-row" style="margin-top:8px;">
@@ -1292,6 +1329,45 @@ async function randomizePredictions(){
   renderAll();
   if (rows.length) await writeInChunks('predictions', rows);
   showToast(`Randomized ${tbd.length} game(s).`);
+}
+
+/* ------------------------- ADMIN: SPORT SETTINGS ------------------------- */
+async function saveSportSettings(){
+  if (!isAdmin) return;
+  const cutoff = document.getElementById('cfgCutoff').value;
+  const bestN  = parseInt(document.getElementById('cfgBestN').value, 10);
+  const firstN = parseInt(document.getElementById('cfgFirstN').value, 10);
+  const minG   = parseInt(document.getElementById('cfgMinGames').value, 10);
+  const ties   = document.getElementById('cfgTies').value === 'yes';
+
+  const problems = [];
+  if (!cutoff) problems.push('Cutoff date is required.');
+  if (!(bestN  > 0)) problems.push('Best N must be a positive number.');
+  if (!(firstN > 0)) problems.push('First N must be a positive number.');
+  if (!(minG   > 0)) problems.push('Minimum games must be a positive number.');
+  if (problems.length){
+    const box = document.getElementById('cfgStatus');
+    box.style.display='block';
+    box.innerHTML = '⚠ ' + problems.join('<br>⚠ ');
+    return;
+  }
+
+  CONFIG.BEST_N = bestN; CONFIG.FIRST_N = firstN; CONFIG.MIN_GAMES = minG;
+  CONFIG.TIES_ALLOWED = ties; CONFIG.CUTOFF_DATE = cutoff;
+
+  const { error } = await sb.from('sports').update({
+    best_n:bestN, first_n:firstN, min_games:minG, ties_allowed:ties, cutoff_date:cutoff
+  }).eq('sport', SPORT);
+
+  renderAll();   // rebuilds every panel with the new numbers
+  const box = document.getElementById('cfgStatus');   // re-fetch: renderAll replaced it
+  if (box){
+    box.style.display = 'block';
+    box.innerHTML = error
+      ? '⚠ Could not save: ' + escapeHtml(error.message)
+      : `Saved. Cutoff ${escapeHtml(cutoff)}, best ${bestN}, first ${firstN}, minimum ${minG}, ties ${ties?'allowed':'not allowed'}. All rankings recalculated.`;
+  }
+  if (!error) showToast('Sport settings saved.');
 }
 
 /* ------------------------- ADMIN: MESSAGE / MAINT ------------------------ */
